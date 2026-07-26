@@ -2,7 +2,7 @@
 
 **Windows x64 PE memory-image dumper and import rebuilder.**
 
-[![Version](https://img.shields.io/badge/version-0.2.0-0ea5e9)](#)
+[![Version](https://img.shields.io/badge/version-0.2.1-0ea5e9)](#)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64-0078d4)](#requirements)
 [![C++](https://img.shields.io/badge/C%2B%2B-20-00599c)](#building)
 [![CMake](https://img.shields.io/badge/CMake-3.20%2B-064f8c)](#building)
@@ -16,7 +16,7 @@ references.
 </div>
 
 > [!WARNING]
-> **Decrypton 0.2.0 is experimental and has not yet been validated across a
+> **Decrypton 0.2.1 is experimental and has not yet been validated across a
 > representative set of real-world targets.** Keep the original executable,
 > inspect every generated file, and do not assume that a successful dump is a
 > fully runnable or analysis-ready PE.
@@ -52,7 +52,7 @@ that you are authorized to inspect.
 * Windows 10 or Windows 11, x64.
 * Visual Studio 2022 with the **Desktop development with C++** workload.
 * A recent Windows SDK.
-* CMake 3.21 or newer.
+* CMake 3.20 or newer.
 * Permission to query and read the target process.
 
 Administrator privileges may be required for some targets. Protected processes,
