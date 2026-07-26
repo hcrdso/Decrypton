@@ -8,6 +8,7 @@
 #include <Windows.h>
 #include <TlHelp32.h>
 #include <winternl.h>
+#include <DbgHelp.h>
 
 #include <algorithm>
 #include <array>
@@ -31,12 +32,15 @@
 #include <utility>
 #include <vector>
 
+#ifdef _MSC_VER
+#pragma comment(lib, "Dbghelp.lib")
+#endif
+
 namespace {
 
-constexpr std::string_view kVersion = "0.2.1";
+constexpr std::string_view kVersion = "0.3.0";
 constexpr SIZE_T kPageSize = 0x1000;
 
-using NtFlushInstructionCacheFn = NTSTATUS(NTAPI*)(HANDLE, PVOID, ULONG);
 
 class UniqueHandle {
 public:
@@ -249,20 +253,20 @@ void progress(
     size_t current,
     size_t total,
     size_t bytes_read,
-    size_t refreshes,
+    size_t partial_pages,
     size_t failures) {
     const double percentage = total == 0
         ? 100.0
         : 100.0 * static_cast<double>(current) / static_cast<double>(total);
     std::printf(
-        "\r  %-8.*s [%5zu/%5zu] %6.2f%%  read=%zu  refresh=%zu  failed=%zu",
+        "\r  %-8.*s [%5zu/%5zu] %6.2f%%  read=%zu  partial=%zu  failed=%zu",
         static_cast<int>((std::min)(section.size(), size_t{8})),
         section.data(),
         current,
         total,
         percentage,
         bytes_read,
-        refreshes,
+        partial_pages,
         failures);
     std::fflush(stdout);
 }
@@ -270,31 +274,49 @@ void progress(
 }  // namespace console
 
 struct Options {
-    std::string process_name = "RobloxPlayerBeta.exe";
+    std::string process_name;
     std::optional<DWORD> pid;
+    std::string module_name;
     std::filesystem::path output;
+    std::filesystem::path report;
+    std::filesystem::path minidump;
     double code_limit = 1.0;
+    double minimum_code_coverage = 0.80;
     bool dump_data = true;
     bool rebuild_imports = true;
     bool aggressive_import_scan = false;
+    bool force_import_rebuild = false;
+    bool list_modules = false;
+    bool write_report = true;
     bool show_help = false;
+    bool show_version = false;
 };
 
 void print_usage() {
     std::printf(
         "Usage:\n"
-        "  decrypton.exe [process.exe] [limit-percent]\n"
         "  decrypton.exe --process <name> [options]\n"
-        "  decrypton.exe --pid <id> [options]\n\n"
+        "  decrypton.exe --pid <id> [options]\n"
+        "  decrypton.exe [process.exe] [limit-percent]\n\n"
         "Options:\n"
         "  -p, --process <name>       Target process name\n"
         "      --pid <id>             Target process ID\n"
+        "  -m, --module <name>        Dump a loaded module instead of the main module\n"
+        "      --list-modules         List loaded modules and exit\n"
         "  -o, --output <path>        Output PE path\n"
-        "  -l, --limit <1-100>        Percentage of each code section to copy\n"
-        "      --no-data              Do not refresh non-executable sections\n"
-        "      --no-imports           Keep the original import directory\n"
-        "      --aggressive-imports   Scan executable sections for resolved imports\n"
-        "  -h, --help                 Show this help\n");
+        "  -l, --limit <1-100>        Percentage of each executable section to copy\n"
+        "      --min-coverage <1-100> Minimum code coverage before import rebuilding\n"
+        "      --no-data              Keep non-executable sections from the disk image\n"
+        "      --no-imports           Preserve original import structures\n"
+        "      --aggressive-imports   Broaden resolved-import scanning\n"
+        "      --force-imports        Keep a rebuilt import table even with weak evidence\n"
+        "      --report <path>        Write a JSON coverage report\n"
+        "      --no-report            Do not write a JSON report\n"
+        "      --minidump <path>      Also create a standard Windows minidump\n"
+        "      --version              Show the program version\n"
+        "  -h, --help                 Show this help\n\n"
+        "Decrypton reads only memory that Windows reports as accessible. It does not\n"
+        "change remote page protections or invoke anti-tamper-specific mechanisms.\n");
 }
 
 bool parse_u32(std::string_view value, DWORD& output) {
@@ -348,6 +370,8 @@ std::optional<Options> parse_options(int argc, char** argv, std::string& error) 
 
         if (argument == "-h" || argument == "--help") {
             options.show_help = true;
+        } else if (argument == "--version") {
+            options.show_version = true;
         } else if (argument == "-p" || argument == "--process") {
             const auto value = require_value(argument);
             if (!value) {
@@ -365,6 +389,14 @@ std::optional<Options> parse_options(int argc, char** argv, std::string& error) 
                 return std::nullopt;
             }
             options.pid = pid;
+        } else if (argument == "-m" || argument == "--module") {
+            const auto value = require_value(argument);
+            if (!value) {
+                return std::nullopt;
+            }
+            options.module_name = std::string(*value);
+        } else if (argument == "--list-modules") {
+            options.list_modules = true;
         } else if (argument == "-o" || argument == "--output") {
             const auto value = require_value(argument);
             if (!value) {
@@ -380,12 +412,38 @@ std::optional<Options> parse_options(int argc, char** argv, std::string& error) 
                 error = "invalid limit; expected a value from 1 to 100";
                 return std::nullopt;
             }
+        } else if (argument == "--min-coverage") {
+            const auto value = require_value(argument);
+            if (!value) {
+                return std::nullopt;
+            }
+            if (!parse_percent(*value, options.minimum_code_coverage)) {
+                error = "invalid minimum coverage; expected a value from 1 to 100";
+                return std::nullopt;
+            }
         } else if (argument == "--no-data") {
             options.dump_data = false;
         } else if (argument == "--no-imports") {
             options.rebuild_imports = false;
         } else if (argument == "--aggressive-imports") {
             options.aggressive_import_scan = true;
+        } else if (argument == "--force-imports") {
+            options.force_import_rebuild = true;
+        } else if (argument == "--report") {
+            const auto value = require_value(argument);
+            if (!value) {
+                return std::nullopt;
+            }
+            options.report = text::to_wide(*value);
+            options.write_report = true;
+        } else if (argument == "--no-report") {
+            options.write_report = false;
+        } else if (argument == "--minidump") {
+            const auto value = require_value(argument);
+            if (!value) {
+                return std::nullopt;
+            }
+            options.minidump = text::to_wide(*value);
         } else if (!argument.empty() && argument.front() == '-') {
             error = "unknown option: " + std::string(argument);
             return std::nullopt;
@@ -406,7 +464,10 @@ std::optional<Options> parse_options(int argc, char** argv, std::string& error) 
         return std::nullopt;
     }
 
-    if (options.process_name.empty() && !options.pid) {
+    if (!options.show_help &&
+        !options.show_version &&
+        options.process_name.empty() &&
+        !options.pid) {
         error = "a process name or PID is required";
         return std::nullopt;
     }
@@ -474,7 +535,7 @@ std::optional<ModuleInfo> main_module(DWORD pid, std::wstring_view preferred_nam
         }
     } while (Module32NextW(snapshot.get(), &entry));
 
-    return first;
+    return preferred_name.empty() ? first : std::nullopt;
 }
 
 std::vector<MODULEENTRY32W> modules(DWORD pid) {
@@ -501,29 +562,121 @@ std::vector<MODULEENTRY32W> modules(DWORD pid) {
 
 namespace memory {
 
-bool is_readable(HANDLE process, const void* address) {
+struct ReadSpan {
+    SIZE_T offset = 0;
+    SIZE_T size = 0;
+};
+
+std::optional<MEMORY_BASIC_INFORMATION> query(
+    HANDLE process,
+    const void* address) {
     MEMORY_BASIC_INFORMATION information{};
     if (VirtualQueryEx(
             process,
             address,
             &information,
             sizeof(information)) != sizeof(information)) {
-        return false;
+        return std::nullopt;
     }
+    return information;
+}
 
-    if (information.State != MEM_COMMIT ||
-        (information.Protect & PAGE_GUARD) != 0 ||
-        (information.Protect & PAGE_NOACCESS) != 0 ||
-        information.Protect == 0) {
-        return false;
-    }
-    return true;
+bool is_readable(const MEMORY_BASIC_INFORMATION& information) {
+    return information.State == MEM_COMMIT &&
+        information.Protect != 0 &&
+        (information.Protect & PAGE_GUARD) == 0 &&
+        (information.Protect & PAGE_NOACCESS) == 0;
 }
 
 SIZE_T read(HANDLE process, const void* address, void* output, SIZE_T size) {
     SIZE_T bytes_read = 0;
     ReadProcessMemory(process, address, output, size, &bytes_read);
     return bytes_read;
+}
+
+SIZE_T read_resilient_impl(
+    HANDLE process,
+    const BYTE* address,
+    BYTE* output,
+    SIZE_T size,
+    SIZE_T base_offset,
+    std::vector<ReadSpan>& spans,
+    unsigned depth) {
+    if (size == 0) {
+        return 0;
+    }
+
+    SIZE_T count = 0;
+    const BOOL success = ReadProcessMemory(
+        process,
+        address,
+        output,
+        size,
+        &count);
+
+    if (count > 0) {
+        spans.push_back({base_offset, count});
+        if (count < size) {
+            return count + read_resilient_impl(
+                process,
+                address + count,
+                output + count,
+                size - count,
+                base_offset + count,
+                spans,
+                depth + 1);
+        }
+        return count;
+    }
+
+    constexpr SIZE_T kMinimumFragment = 64;
+    constexpr unsigned kMaximumDepth = 12;
+    if (success || size <= kMinimumFragment || depth >= kMaximumDepth) {
+        return 0;
+    }
+
+    SIZE_T left_size = size / 2;
+    left_size -= left_size % kMinimumFragment;
+    if (left_size == 0 || left_size >= size) {
+        return 0;
+    }
+
+    const SIZE_T right_size = size - left_size;
+    return read_resilient_impl(
+               process,
+               address,
+               output,
+               left_size,
+               base_offset,
+               spans,
+               depth + 1) +
+        read_resilient_impl(
+               process,
+               address + left_size,
+               output + left_size,
+               right_size,
+               base_offset + left_size,
+               spans,
+               depth + 1);
+}
+
+SIZE_T read_resilient(
+    HANDLE process,
+    const void* address,
+    void* output,
+    SIZE_T size,
+    std::vector<ReadSpan>& spans) {
+    spans.clear();
+    const auto* source = static_cast<const BYTE*>(address);
+    auto* destination = static_cast<BYTE*>(output);
+    return read_resilient_impl(
+        process,
+        source,
+        destination,
+        size,
+        0,
+        spans,
+        0);
 }
 
 template <typename T>
@@ -784,10 +937,21 @@ private:
     bool normalized_ = true;
 };
 
+struct MemoryIssue {
+    std::string section;
+    uint32_t rva = 0;
+    uint64_t address = 0;
+    size_t requested = 0;
+    size_t copied = 0;
+    DWORD state = 0;
+    DWORD protect = 0;
+    DWORD type = 0;
+};
+
 struct CopyStats {
     size_t requested = 0;
     size_t copied = 0;
-    size_t refreshes = 0;
+    size_t partial_pages = 0;
     size_t failed_pages = 0;
 };
 
@@ -797,9 +961,9 @@ CopyStats copy_section_from_process(
     DWORD module_size,
     const IMAGE_SECTION_HEADER& section,
     double limit,
-    NtFlushInstructionCacheFn refresh,
     std::vector<BYTE>& image,
-    RvaRanges& copied_ranges) {
+    RvaRanges& copied_ranges,
+    std::vector<MemoryIssue>& issues) {
     CopyStats stats;
 
     const uint64_t raw_start = section.PointerToRawData;
@@ -837,29 +1001,49 @@ CopyStats copy_section_from_process(
         auto* local = image.data() + section.PointerToRawData + offset;
 
         SIZE_T count = 0;
-        if (memory::is_readable(process_handle, remote)) {
-            count = memory::read(process_handle, remote, local, chunk);
-        }
-
-        if (count == 0 && refresh != nullptr) {
-            refresh(
+        std::vector<memory::ReadSpan> spans;
+        const auto information = memory::query(process_handle, remote);
+        if (information && memory::is_readable(*information)) {
+            count = memory::read_resilient(
                 process_handle,
                 remote,
-                static_cast<ULONG>(chunk));
-            ++stats.refreshes;
-            if (memory::is_readable(process_handle, remote)) {
-                count = memory::read(process_handle, remote, local, chunk);
-            }
+                local,
+                chunk,
+                spans);
         }
 
-        if (count > 0) {
-            stats.copied += count;
+        for (const memory::ReadSpan& span : spans) {
+            if (span.size == 0 ||
+                span.offset > chunk ||
+                span.size > chunk - span.offset) {
+                continue;
+            }
             copied_ranges.add(
-                section.VirtualAddress + static_cast<uint32_t>(offset),
-                count);
+                section.VirtualAddress +
+                    static_cast<uint32_t>(offset + span.offset),
+                span.size);
         }
-        if (count < chunk) {
+
+        stats.copied += count;
+        if (count == 0) {
             ++stats.failed_pages;
+        } else if (count < chunk) {
+            ++stats.partial_pages;
+        }
+
+        if (count < chunk) {
+            MemoryIssue issue;
+            issue.section = name;
+            issue.rva = section.VirtualAddress + static_cast<uint32_t>(offset);
+            issue.address = reinterpret_cast<uint64_t>(remote);
+            issue.requested = chunk;
+            issue.copied = count;
+            if (information) {
+                issue.state = information->State;
+                issue.protect = information->Protect;
+                issue.type = information->Type;
+            }
+            issues.push_back(std::move(issue));
         }
 
         console::progress(
@@ -867,7 +1051,7 @@ CopyStats copy_section_from_process(
             page + 1,
             selected_pages,
             stats.copied,
-            stats.refreshes,
+            stats.partial_pages,
             stats.failed_pages);
     }
     std::printf("\n");
@@ -913,7 +1097,9 @@ size_t restore_relocations(
             break;
         }
 
-        const uint32_t entry_bytes = block.SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION);
+        const uint32_t entry_bytes =
+            block.SizeOfBlock -
+            static_cast<uint32_t>(sizeof(IMAGE_BASE_RELOCATION));
         const uint32_t entry_count = entry_bytes / sizeof(WORD);
         const auto entries_offset = pe.rva_to_offset(
             block_rva + sizeof(IMAGE_BASE_RELOCATION), entry_bytes);
@@ -1096,6 +1282,7 @@ std::unordered_map<uint64_t, ExportSymbol> build_export_map(
 std::vector<FoundImport> find_imports(
     std::vector<BYTE>& image,
     const std::unordered_map<uint64_t, ExportSymbol>& exports,
+    RvaRanges& copied_ranges,
     bool aggressive) {
     std::vector<FoundImport> output;
     std::unordered_set<uint32_t> seen_rvas;
@@ -1118,7 +1305,10 @@ std::vector<FoundImport> find_imports(
         }
 
         const auto rva = pe.offset_to_rva(raw_offset);
-        if (!rva || !seen_rvas.insert(*rva).second) {
+        if (!rva || !copied_ranges.contains(*rva, sizeof(uint64_t))) {
+            return false;
+        }
+        if (!seen_rvas.insert(*rva).second) {
             return true;
         }
 
@@ -1156,12 +1346,14 @@ std::vector<FoundImport> find_imports(
             static_cast<uint64_t>(image.size())));
         const DWORD aligned_start = align_up(start, static_cast<DWORD>(sizeof(uint64_t)));
         const std::string section_name = PeImage::section_name(section);
-        const bool allow_single = aggressive || section_name == ".idata" ||
-            section_name == ".rdata" || section_name == ".data";
+        const bool allow_single = aggressive;
+        const bool conventional_import_section =
+            section_name == ".idata" || section_name == ".rdata" ||
+            section_name == ".data";
 
         std::vector<DWORD> run;
         auto commit_run = [&]() {
-            if (allow_single || run.size() >= 2) {
+            if (allow_single || run.size() >= (conventional_import_section ? 2u : 3u)) {
                 for (DWORD raw_offset : run) {
                     add_candidate(raw_offset);
                 }
@@ -1191,7 +1383,8 @@ std::vector<FoundImport> find_imports(
 
 size_t patch_rip_relative_references(
     std::vector<BYTE>& image,
-    const std::unordered_map<uint32_t, uint32_t>& old_iat_to_new_iat) {
+    const std::unordered_map<uint32_t, uint32_t>& old_iat_to_new_iat,
+    std::unordered_set<uint32_t>& patched_slots) {
     if (old_iat_to_new_iat.empty()) {
         return 0;
     }
@@ -1274,6 +1467,7 @@ size_t patch_rip_relative_references(
                 image.data() + displacement_offset,
                 &encoded,
                 sizeof(encoded));
+            patched_slots.insert(static_cast<uint32_t>(target));
             ++patched;
         }
     }
@@ -1293,8 +1487,10 @@ bool rebuild(
     std::vector<BYTE>& image,
     const std::vector<FoundImport>& found,
     size_t& patched_references,
+    size_t& patched_slots,
     std::string& error) {
     patched_references = 0;
+    patched_slots = 0;
     if (found.empty()) {
         error = "no resolved imports were found";
         return false;
@@ -1423,7 +1619,7 @@ bool rebuild(
 
     IMAGE_SECTION_HEADER* new_section =
         &sections[nt->FileHeader.NumberOfSections];
-    std::memset(new_section, 0, sizeof(*new_section));
+    *new_section = {};
     constexpr char section_name[] = ".dcrypt";
     std::memcpy(new_section->Name, section_name, sizeof(section_name) - 1);
     new_section->Misc.VirtualSize = virtual_size;
@@ -1500,11 +1696,450 @@ bool rebuild(
     nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT] = {};
     nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY] = {};
 
-    patched_references = patch_rip_relative_references(image, old_iat_to_new_iat);
+    std::unordered_set<uint32_t> redirected_slots;
+    patched_references = patch_rip_relative_references(
+        image,
+        old_iat_to_new_iat,
+        redirected_slots);
+    patched_slots = redirected_slots.size();
     return true;
 }
 
 }  // namespace imports
+
+bool copy_rva_range(
+    std::vector<BYTE>& destination,
+    std::vector<BYTE>& source,
+    DWORD rva,
+    size_t size) {
+    if (size == 0) {
+        return true;
+    }
+
+    PeImage destination_pe(destination);
+    PeImage source_pe(source);
+    const auto destination_offset = destination_pe.rva_to_offset(rva, size);
+    const auto source_offset = source_pe.rva_to_offset(rva, size);
+    if (!destination_offset || !source_offset) {
+        return false;
+    }
+
+    std::memcpy(
+        destination.data() + *destination_offset,
+        source.data() + *source_offset,
+        size);
+    return true;
+}
+
+bool copy_rva_string(
+    std::vector<BYTE>& destination,
+    std::vector<BYTE>& source,
+    DWORD rva,
+    size_t maximum_length = 4096) {
+    PeImage source_pe(source);
+    const auto source_offset = source_pe.rva_to_offset(rva, 1);
+    if (!source_offset) {
+        return false;
+    }
+
+    size_t length = 0;
+    while (length < maximum_length &&
+           static_cast<uint64_t>(*source_offset) + length < source.size()) {
+        if (source[*source_offset + length] == 0) {
+            return copy_rva_range(destination, source, rva, length + 1);
+        }
+        ++length;
+    }
+    return false;
+}
+
+bool restore_original_imports(
+    std::vector<BYTE>& image,
+    std::vector<BYTE>& disk_image,
+    std::string& error) {
+    PeImage current(image);
+    PeImage original(disk_image);
+    IMAGE_NT_HEADERS64* current_nt = current.nt();
+    IMAGE_NT_HEADERS64* original_nt = original.nt();
+    if (current_nt == nullptr || original_nt == nullptr) {
+        error = "invalid PE while restoring original imports";
+        return false;
+    }
+
+    if (original_nt->OptionalHeader.NumberOfRvaAndSizes <=
+            IMAGE_DIRECTORY_ENTRY_IMPORT) {
+        return true;
+    }
+
+    const IMAGE_DATA_DIRECTORY import_directory =
+        original_nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    const IMAGE_DATA_DIRECTORY iat_directory =
+        original_nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_IAT
+        ? original_nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT]
+        : IMAGE_DATA_DIRECTORY{};
+
+    current_nt->OptionalHeader.NumberOfRvaAndSizes = (std::min)(
+        static_cast<DWORD>(IMAGE_NUMBEROF_DIRECTORY_ENTRIES),
+        (std::max)(
+            current_nt->OptionalHeader.NumberOfRvaAndSizes,
+            original_nt->OptionalHeader.NumberOfRvaAndSizes));
+    current_nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT] =
+        import_directory;
+    current_nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT] =
+        iat_directory;
+    current_nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT] = {};
+
+    if (import_directory.VirtualAddress == 0 ||
+        import_directory.Size < sizeof(IMAGE_IMPORT_DESCRIPTOR)) {
+        return true;
+    }
+
+    constexpr size_t kMaximumDescriptors = 4096;
+    constexpr size_t kMaximumThunksPerDescriptor = 1'000'000;
+
+    for (size_t descriptor_index = 0;
+         descriptor_index < kMaximumDescriptors;
+         ++descriptor_index) {
+        const uint64_t descriptor_rva64 =
+            static_cast<uint64_t>(import_directory.VirtualAddress) +
+            descriptor_index * sizeof(IMAGE_IMPORT_DESCRIPTOR);
+        if (descriptor_rva64 > (std::numeric_limits<DWORD>::max)()) {
+            error = "original import descriptor RVA overflow";
+            return false;
+        }
+
+        const DWORD descriptor_rva = static_cast<DWORD>(descriptor_rva64);
+        const auto descriptor_offset =
+            original.rva_to_offset(descriptor_rva, sizeof(IMAGE_IMPORT_DESCRIPTOR));
+        if (!descriptor_offset) {
+            error = "original import descriptor is outside the image";
+            return false;
+        }
+
+        IMAGE_IMPORT_DESCRIPTOR descriptor{};
+        std::memcpy(
+            &descriptor,
+            disk_image.data() + *descriptor_offset,
+            sizeof(descriptor));
+
+        if (!copy_rva_range(
+                image,
+                disk_image,
+                descriptor_rva,
+                sizeof(IMAGE_IMPORT_DESCRIPTOR))) {
+            error = "failed to restore an original import descriptor";
+            return false;
+        }
+
+        if (descriptor.OriginalFirstThunk == 0 &&
+            descriptor.FirstThunk == 0 &&
+            descriptor.Name == 0) {
+            return true;
+        }
+
+        if (descriptor.Name != 0 &&
+            !copy_rva_string(image, disk_image, descriptor.Name)) {
+            error = "failed to restore an imported module name";
+            return false;
+        }
+
+        const DWORD lookup_rva = descriptor.OriginalFirstThunk != 0
+            ? descriptor.OriginalFirstThunk
+            : descriptor.FirstThunk;
+
+        for (size_t thunk_index = 0;
+             thunk_index < kMaximumThunksPerDescriptor;
+             ++thunk_index) {
+            const uint64_t lookup_entry_rva64 =
+                static_cast<uint64_t>(lookup_rva) +
+                thunk_index * sizeof(IMAGE_THUNK_DATA64);
+            const uint64_t iat_entry_rva64 =
+                static_cast<uint64_t>(descriptor.FirstThunk) +
+                thunk_index * sizeof(IMAGE_THUNK_DATA64);
+            if (lookup_entry_rva64 > (std::numeric_limits<DWORD>::max)() ||
+                iat_entry_rva64 > (std::numeric_limits<DWORD>::max)()) {
+                error = "original import thunk RVA overflow";
+                return false;
+            }
+
+            const DWORD lookup_entry_rva =
+                static_cast<DWORD>(lookup_entry_rva64);
+            const DWORD iat_entry_rva = static_cast<DWORD>(iat_entry_rva64);
+            const auto lookup_offset = original.rva_to_offset(
+                lookup_entry_rva,
+                sizeof(IMAGE_THUNK_DATA64));
+            if (!lookup_offset) {
+                error = "original import lookup table is outside the image";
+                return false;
+            }
+
+            IMAGE_THUNK_DATA64 thunk{};
+            std::memcpy(
+                &thunk,
+                disk_image.data() + *lookup_offset,
+                sizeof(thunk));
+
+            if (!copy_rva_range(
+                    image,
+                    disk_image,
+                    lookup_entry_rva,
+                    sizeof(IMAGE_THUNK_DATA64)) ||
+                !copy_rva_range(
+                    image,
+                    disk_image,
+                    iat_entry_rva,
+                    sizeof(IMAGE_THUNK_DATA64))) {
+                error = "failed to restore original import thunks";
+                return false;
+            }
+
+            if (thunk.u1.AddressOfData == 0) {
+                break;
+            }
+
+            if ((thunk.u1.Ordinal & IMAGE_ORDINAL_FLAG64) == 0) {
+                if (thunk.u1.AddressOfData >
+                    (std::numeric_limits<DWORD>::max)()) {
+                    error = "original import-by-name RVA overflow";
+                    return false;
+                }
+
+                const DWORD name_rva =
+                    static_cast<DWORD>(thunk.u1.AddressOfData);
+                if (!copy_rva_range(
+                        image,
+                        disk_image,
+                        name_rva,
+                        sizeof(WORD)) ||
+                    !copy_rva_string(
+                        image,
+                        disk_image,
+                        name_rva + sizeof(WORD))) {
+                    error = "failed to restore an original import name";
+                    return false;
+                }
+            }
+        }
+    }
+
+    error = "original import descriptor list is not terminated";
+    return false;
+}
+
+bool write_minidump(
+    HANDLE process_handle,
+    DWORD pid,
+    const std::filesystem::path& path,
+    std::string& error) {
+    std::error_code filesystem_error;
+    if (path.has_parent_path()) {
+        std::filesystem::create_directories(
+            path.parent_path(),
+            filesystem_error);
+        if (filesystem_error) {
+            error = "cannot create minidump directory: " +
+                filesystem_error.message();
+            return false;
+        }
+    }
+
+    UniqueHandle file(CreateFileW(
+        path.c_str(),
+        GENERIC_WRITE,
+        0,
+        nullptr,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr));
+    if (!file) {
+        error = "cannot create minidump: " + text::win32_error();
+        return false;
+    }
+
+    const auto type = static_cast<MINIDUMP_TYPE>(
+        MiniDumpWithDataSegs |
+        MiniDumpWithHandleData |
+        MiniDumpWithUnloadedModules |
+        MiniDumpWithFullMemoryInfo |
+        MiniDumpWithThreadInfo |
+        MiniDumpWithCodeSegs);
+
+    if (!MiniDumpWriteDump(
+            process_handle,
+            pid,
+            file.get(),
+            type,
+            nullptr,
+            nullptr,
+            nullptr)) {
+        error = "MiniDumpWriteDump failed: " + text::win32_error();
+        return false;
+    }
+    return true;
+}
+
+std::string json_escape(std::string_view value) {
+    std::string output;
+    output.reserve(value.size() + 16);
+    for (const char raw_character : value) {
+        const auto character = static_cast<unsigned char>(raw_character);
+        switch (character) {
+        case '"':
+            output += "\\\"";
+            break;
+        case '\\':
+            output += "\\\\";
+            break;
+        case '\b':
+            output += "\\b";
+            break;
+        case '\f':
+            output += "\\f";
+            break;
+        case '\n':
+            output += "\\n";
+            break;
+        case '\r':
+            output += "\\r";
+            break;
+        case '\t':
+            output += "\\t";
+            break;
+        default:
+            if (character < 0x20) {
+                char buffer[7]{};
+                std::snprintf(
+                    buffer,
+                    sizeof(buffer),
+                    "\\u%04X",
+                    static_cast<unsigned>(character));
+                output += buffer;
+            } else {
+                output.push_back(static_cast<char>(character));
+            }
+            break;
+        }
+    }
+    return output;
+}
+
+bool write_json_report(
+    const std::filesystem::path& path,
+    DWORD pid,
+    const process::ModuleInfo& module,
+    const Options& options,
+    const CopyStats& code,
+    const CopyStats& data,
+    const std::vector<MemoryIssue>& issues,
+    size_t restored_relocations,
+    size_t found_imports,
+    bool imports_rebuilt,
+    size_t patched_references,
+    size_t patched_slots,
+    std::string& error) {
+    std::error_code filesystem_error;
+    if (path.has_parent_path()) {
+        std::filesystem::create_directories(
+            path.parent_path(),
+            filesystem_error);
+        if (filesystem_error) {
+            error = "cannot create report directory: " +
+                filesystem_error.message();
+            return false;
+        }
+    }
+
+    std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+    if (!stream) {
+        error = "cannot create JSON report";
+        return false;
+    }
+
+    const double code_coverage = code.requested == 0
+        ? 1.0
+        : static_cast<double>(code.copied) /
+            static_cast<double>(code.requested);
+    const double data_coverage = data.requested == 0
+        ? 1.0
+        : static_cast<double>(data.copied) /
+            static_cast<double>(data.requested);
+
+    stream << "{\n";
+    stream << "  \"tool\": \"decrypton\",\n";
+    stream << "  \"version\": \"" << kVersion << "\",\n";
+    stream << "  \"pid\": " << pid << ",\n";
+    stream << "  \"module\": {\n";
+    stream << "    \"name\": \"" <<
+        json_escape(text::to_utf8(module.name)) << "\",\n";
+    stream << "    \"path\": \"" <<
+        json_escape(text::to_utf8(module.path.wstring())) << "\",\n";
+    stream << "    \"base\": \"0x" << std::hex <<
+        reinterpret_cast<uint64_t>(module.base) << std::dec << "\",\n";
+    stream << "    \"size\": " << module.size << "\n";
+    stream << "  },\n";
+    stream << "  \"options\": {\n";
+    stream << "    \"code_limit\": " << options.code_limit << ",\n";
+    stream << "    \"minimum_code_coverage\": " <<
+        options.minimum_code_coverage << ",\n";
+    stream << "    \"dump_data\": " <<
+        (options.dump_data ? "true" : "false") << ",\n";
+    stream << "    \"rebuild_imports\": " <<
+        (options.rebuild_imports ? "true" : "false") << ",\n";
+    stream << "    \"aggressive_import_scan\": " <<
+        (options.aggressive_import_scan ? "true" : "false") << "\n";
+    stream << "  },\n";
+    stream << "  \"coverage\": {\n";
+    stream << "    \"code_requested\": " << code.requested << ",\n";
+    stream << "    \"code_copied\": " << code.copied << ",\n";
+    stream << "    \"code_ratio\": " << code_coverage << ",\n";
+    stream << "    \"code_partial_pages\": " << code.partial_pages << ",\n";
+    stream << "    \"code_failed_pages\": " << code.failed_pages << ",\n";
+    stream << "    \"data_requested\": " << data.requested << ",\n";
+    stream << "    \"data_copied\": " << data.copied << ",\n";
+    stream << "    \"data_ratio\": " << data_coverage << ",\n";
+    stream << "    \"data_partial_pages\": " << data.partial_pages << ",\n";
+    stream << "    \"data_failed_pages\": " << data.failed_pages << "\n";
+    stream << "  },\n";
+    stream << "  \"relocations_restored\": " <<
+        restored_relocations << ",\n";
+    stream << "  \"imports\": {\n";
+    stream << "    \"found_slots\": " << found_imports << ",\n";
+    stream << "    \"rebuilt\": " <<
+        (imports_rebuilt ? "true" : "false") << ",\n";
+    stream << "    \"patched_references\": " <<
+        patched_references << ",\n";
+    stream << "    \"redirected_slots\": " <<
+        patched_slots << "\n";
+    stream << "  },\n";
+    stream << "  \"memory_issues\": [\n";
+
+    for (size_t index = 0; index < issues.size(); ++index) {
+        const MemoryIssue& issue = issues[index];
+        stream << "    {\"section\":\"" <<
+            json_escape(issue.section) <<
+            "\",\"rva\":\"0x" << std::hex << issue.rva <<
+            "\",\"address\":\"0x" << issue.address <<
+            "\",\"requested\":" << std::dec << issue.requested <<
+            ",\"copied\":" << issue.copied <<
+            ",\"state\":\"0x" << std::hex << issue.state <<
+            "\",\"protect\":\"0x" << issue.protect <<
+            "\",\"type\":\"0x" << issue.type << std::dec << "}";
+        if (index + 1 != issues.size()) {
+            stream << ",";
+        }
+        stream << "\n";
+    }
+
+    stream << "  ]\n";
+    stream << "}\n";
+    stream.flush();
+    if (!stream) {
+        error = "failed while writing JSON report";
+        return false;
+    }
+    return true;
+}
+
 
 bool read_file(
     const std::filesystem::path& path,
@@ -1568,10 +2203,21 @@ bool write_file(
 std::filesystem::path default_output_name(std::wstring_view module_name) {
     std::filesystem::path path{std::wstring(module_name)};
     std::wstring stem = path.stem().wstring();
+    std::wstring extension = path.extension().wstring();
     if (stem.empty()) {
         stem = L"decrypton";
     }
-    return stem + L"-dumped.exe";
+    if (extension.empty()) {
+        extension = L".bin";
+    }
+    return stem + L"-dumped" + extension;
+}
+
+std::filesystem::path default_report_name(
+    const std::filesystem::path& output) {
+    std::filesystem::path report = output;
+    report += L".json";
+    return report;
 }
 
 }  // namespace
@@ -1594,10 +2240,20 @@ int main(int argc, char** argv) {
         print_usage();
         return 0;
     }
+    if (options.show_version) {
+        std::printf("decrypton %.*s\n",
+            static_cast<int>(kVersion.size()),
+            kVersion.data());
+        return 0;
+    }
 
     const std::wstring process_name = text::to_wide(options.process_name);
-    if (process_name.empty() && !options.pid) {
+    if (!options.process_name.empty() && process_name.empty()) {
         console::failure("process name is not valid UTF-8");
+        return 2;
+    }
+    if (!options.pid && process_name.empty()) {
+        console::failure("a process name or PID is required");
         return 2;
     }
 
@@ -1608,22 +2264,64 @@ int main(int argc, char** argv) {
     }
 
     UniqueHandle process_handle(OpenProcess(
-        PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_VM_OPERATION,
+        PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
         FALSE,
         pid));
     if (!process_handle) {
-        console::failure("OpenProcess failed: %s", text::win32_error().c_str());
+        console::failure(
+            "OpenProcess failed: %s",
+            text::win32_error().c_str());
         return 1;
     }
 
-    const auto module = process::main_module(pid, options.pid ? L"" : process_name);
+    if (options.list_modules) {
+        const auto loaded_modules = process::modules(pid);
+        if (loaded_modules.empty()) {
+            console::failure("no modules could be enumerated");
+            return 1;
+        }
+
+        std::printf("%-18s %-12s %-28s %s\n", "Base", "Size", "Module", "Path");
+        for (const MODULEENTRY32W& entry : loaded_modules) {
+            std::printf(
+                "0x%016llX %-12lu %-28s %s\n",
+                static_cast<unsigned long long>(
+                    reinterpret_cast<uintptr_t>(entry.modBaseAddr)),
+                static_cast<unsigned long>(entry.modBaseSize),
+                text::to_utf8(entry.szModule).c_str(),
+                text::to_utf8(entry.szExePath).c_str());
+        }
+        return 0;
+    }
+
+    const std::wstring requested_module =
+        text::to_wide(options.module_name);
+    if (!options.module_name.empty() && requested_module.empty()) {
+        console::failure("module name is not valid UTF-8");
+        return 2;
+    }
+
+    std::wstring preferred_module;
+    if (!requested_module.empty()) {
+        preferred_module = requested_module;
+    } else if (!options.pid) {
+        preferred_module = process_name;
+    }
+
+    const auto module = process::main_module(pid, preferred_module);
     if (!module) {
-        console::failure("main module lookup failed: %s", text::win32_error().c_str());
+        console::failure(
+            preferred_module.empty()
+                ? "main module lookup failed"
+                : "requested module was not found");
         return 1;
     }
 
     if (options.output.empty()) {
         options.output = default_output_name(module->name);
+    }
+    if (options.write_report && options.report.empty()) {
+        options.report = default_report_name(options.output);
     }
 
     console::info("PID: %lu\n", pid);
@@ -1632,15 +2330,30 @@ int main(int argc, char** argv) {
         text::to_utf8(module->name).c_str(),
         module->base,
         module->size);
-    console::info("disk image: %s\n", text::to_utf8(module->path.wstring()).c_str());
-    console::info("code limit: %.2f%%\n", options.code_limit * 100.0);
-    console::info("output: %s\n", text::to_utf8(options.output.wstring()).c_str());
+    console::info(
+        "disk image: %s\n",
+        text::to_utf8(module->path.wstring()).c_str());
+    console::info(
+        "code limit: %.2f%%\n",
+        options.code_limit * 100.0);
+    console::info(
+        "minimum import coverage: %.2f%%\n",
+        options.minimum_code_coverage * 100.0);
+    console::info(
+        "output: %s\n",
+        text::to_utf8(options.output.wstring()).c_str());
+    if (options.write_report) {
+        console::info(
+            "report: %s\n",
+            text::to_utf8(options.report.wstring()).c_str());
+    }
 
     std::vector<BYTE> image;
     if (!read_file(module->path, image, error)) {
         console::failure("%s", error.c_str());
         return 1;
     }
+    std::vector<BYTE> disk_image = image;
 
     PeImage pe(image);
     if (!pe.validate(error)) {
@@ -1649,16 +2362,11 @@ int main(int argc, char** argv) {
     }
     console::success("loaded %zu bytes from disk", image.size());
 
-    const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-    const auto refresh = ntdll == nullptr
-        ? nullptr
-        : reinterpret_cast<NtFlushInstructionCacheFn>(
-              GetProcAddress(ntdll, "NtFlushInstructionCache"));
-
     const auto sections = pe.copy_sections();
     RvaRanges copied_ranges;
     CopyStats code_total;
     CopyStats data_total;
+    std::vector<MemoryIssue> memory_issues;
 
     console::info("copying executable sections\n");
     for (const IMAGE_SECTION_HEADER& section : sections) {
@@ -1675,12 +2383,12 @@ int main(int argc, char** argv) {
             module->size,
             section,
             options.code_limit,
-            refresh,
             image,
-            copied_ranges);
+            copied_ranges,
+            memory_issues);
         code_total.requested += stats.requested;
         code_total.copied += stats.copied;
-        code_total.refreshes += stats.refreshes;
+        code_total.partial_pages += stats.partial_pages;
         code_total.failed_pages += stats.failed_pages;
     }
 
@@ -1700,27 +2408,45 @@ int main(int argc, char** argv) {
                 module->size,
                 section,
                 1.0,
-                refresh,
                 image,
-                copied_ranges);
+                copied_ranges,
+                memory_issues);
             data_total.requested += stats.requested;
             data_total.copied += stats.copied;
-            data_total.refreshes += stats.refreshes;
+            data_total.partial_pages += stats.partial_pages;
             data_total.failed_pages += stats.failed_pages;
         }
     }
 
+    const double code_coverage = code_total.requested == 0
+        ? 1.0
+        : static_cast<double>(code_total.copied) /
+            static_cast<double>(code_total.requested);
+
     console::success(
-        "code copied: %zu / %zu bytes (%zu failed pages)",
+        "code copied: %zu / %zu bytes (%.2f%%, %zu partial, %zu failed pages)",
         code_total.copied,
         code_total.requested,
+        code_coverage * 100.0,
+        code_total.partial_pages,
         code_total.failed_pages);
     if (options.dump_data) {
+        const double data_coverage = data_total.requested == 0
+            ? 1.0
+            : static_cast<double>(data_total.copied) /
+                static_cast<double>(data_total.requested);
         console::success(
-            "data copied: %zu / %zu bytes (%zu failed pages)",
+            "data copied: %zu / %zu bytes (%.2f%%, %zu partial, %zu failed pages)",
             data_total.copied,
             data_total.requested,
+            data_coverage * 100.0,
+            data_total.partial_pages,
             data_total.failed_pages);
+    }
+
+    if (code_coverage < 1.0) {
+        console::warning(
+            "output is a hybrid image; unreadable fragments were preserved from disk");
     }
 
     const size_t restored_relocations = restore_relocations(
@@ -1728,15 +2454,51 @@ int main(int argc, char** argv) {
         reinterpret_cast<uintptr_t>(module->base),
         copied_ranges);
     if (restored_relocations > 0) {
-        console::success("restored %zu relocated addresses", restored_relocations);
+        console::success(
+            "restored %zu relocated addresses",
+            restored_relocations);
     } else {
-        console::info("no copied relocation entries required normalization\n");
+        console::info(
+            "no copied relocation entries required normalization\n");
     }
 
-    if (options.rebuild_imports) {
+    size_t found_imports = 0;
+    size_t patched_references = 0;
+    size_t patched_slots = 0;
+    bool imports_rebuilt = false;
+
+    auto restore_imports = [&]() {
+        std::string restore_error;
+        if (restore_original_imports(
+                image,
+                disk_image,
+                restore_error)) {
+            console::success("preserved original import structures");
+            return true;
+        }
+
+        console::warning(
+            "could not fully restore original imports: %s",
+            restore_error.c_str());
+        return false;
+    };
+
+    if (!options.rebuild_imports) {
+        restore_imports();
+    } else if (code_coverage < options.minimum_code_coverage &&
+               !options.force_import_rebuild) {
+        console::warning(
+            "import rebuild skipped: code coverage %.2f%% is below %.2f%%",
+            code_coverage * 100.0,
+            options.minimum_code_coverage * 100.0);
+        restore_imports();
+    } else {
         console::info("building loaded export map\n");
-        const auto exports = imports::build_export_map(process_handle.get(), pid);
-        console::success("indexed %zu named exports", exports.size());
+        const auto exports =
+            imports::build_export_map(process_handle.get(), pid);
+        console::success(
+            "indexed %zu named exports",
+            exports.size());
 
         console::info(
             "scanning resolved imports (%s mode)\n",
@@ -1744,8 +2506,12 @@ int main(int argc, char** argv) {
         const auto found = imports::find_imports(
             image,
             exports,
+            copied_ranges,
             options.aggressive_import_scan);
-        console::success("found %zu import slots", found.size());
+        found_imports = found.size();
+        console::success(
+            "found %zu copied import slots",
+            found_imports);
 
         if (!found.empty()) {
             std::map<std::string, size_t, std::less<>> module_counts;
@@ -1753,25 +2519,51 @@ int main(int argc, char** argv) {
                 ++module_counts[import.module];
             }
             for (const auto& [name, count] : module_counts) {
-                std::printf("  %-24s %zu\n", name.c_str(), count);
+                std::printf("  %-28s %zu\n", name.c_str(), count);
             }
 
-            size_t patched_references = 0;
-            if (imports::rebuild(image, found, patched_references, error)) {
-                console::success(
-                    "rebuilt imports and patched %zu RIP-relative references",
-                    patched_references);
+            const std::vector<BYTE> before_rebuild = image;
+            error.clear();
+            if (imports::rebuild(
+                    image,
+                    found,
+                    patched_references,
+                    patched_slots,
+                    error)) {
+                if (patched_slots != found_imports &&
+                    !options.force_import_rebuild) {
+                    image = before_rebuild;
+                    console::warning(
+                        "rebuilt table rejected: redirected %zu / %zu import slots",
+                        patched_slots,
+                        found_imports);
+                    restore_imports();
+                } else {
+                    imports_rebuilt = true;
+                    console::success(
+                        "rebuilt imports: %zu redirected slots, %zu RIP-relative references",
+                        patched_slots,
+                        patched_references);
+                }
             } else {
-                console::warning("import rebuild skipped: %s", error.c_str());
+                image = before_rebuild;
+                console::warning(
+                    "import rebuild skipped: %s",
+                    error.c_str());
+                restore_imports();
             }
         } else {
-            console::warning("no imports found; preserving the original directory");
+            console::warning(
+                "no reliable imports found; preserving the original directory");
+            restore_imports();
         }
     }
 
     PeImage final_pe(image);
     if (!final_pe.validate(error)) {
-        console::failure("output validation failed: %s", error.c_str());
+        console::failure(
+            "output validation failed: %s",
+            error.c_str());
         return 1;
     }
 
@@ -1780,7 +2572,13 @@ int main(int argc, char** argv) {
         final_nt->OptionalHeader.CheckSum = 0;
         if (final_nt->OptionalHeader.NumberOfRvaAndSizes >
             IMAGE_DIRECTORY_ENTRY_SECURITY) {
-            final_nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY] = {};
+            final_nt->OptionalHeader
+                .DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY] = {};
+        }
+        if (final_nt->OptionalHeader.NumberOfRvaAndSizes >
+            IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT) {
+            final_nt->OptionalHeader
+                .DataDirectory[IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT] = {};
         }
     }
 
@@ -1792,8 +2590,49 @@ int main(int argc, char** argv) {
     console::success(
         "saved %s (%zu bytes)",
         text::to_utf8(options.output.wstring()).c_str(),
-        image.size()); 
+        image.size());
+
+    if (options.write_report) {
+        std::string report_error;
+        if (write_json_report(
+                options.report,
+                pid,
+                *module,
+                options,
+                code_total,
+                data_total,
+                memory_issues,
+                restored_relocations,
+                found_imports,
+                imports_rebuilt,
+                patched_references,
+                patched_slots,
+                report_error)) {
+            console::success(
+                "saved report %s",
+                text::to_utf8(options.report.wstring()).c_str());
+        } else {
+            console::warning(
+                "report was not written: %s",
+                report_error.c_str());
+        }
+    }
+
+    if (!options.minidump.empty()) {
+        std::string minidump_error;
+        if (write_minidump(
+                process_handle.get(),
+                pid,
+                options.minidump,
+                minidump_error)) {
+            console::success(
+                "saved minidump %s",
+                text::to_utf8(options.minidump.wstring()).c_str());
+        } else {
+            console::warning(
+                "minidump was not written: %s",
+                minidump_error.c_str());
+        }
+    }
     return 0;
 }
-
-// ignore this comment
