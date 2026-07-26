@@ -5,7 +5,7 @@
 [![Version](https://img.shields.io/badge/version-0.2.0-0ea5e9)](#)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64-0078d4)](#requirements)
 [![C++](https://img.shields.io/badge/C%2B%2B-20-00599c)](#building)
-[![CMake](https://img.shields.io/badge/CMake-3.21%2B-064f8c)](#building)
+[![CMake](https://img.shields.io/badge/CMake-3.20%2B-064f8c)](#building)
 [![Status](https://img.shields.io/badge/status-experimental-f59e0b)](#project-status)
 
 Decrypton combines an executable's on-disk PE image with selected file-backed
