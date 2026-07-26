@@ -16,21 +16,6 @@
 > [!WARNING]
 > Version 0.3.0 is experimental. A structurally valid output file is not necessarily runnable. Always retain the original executable and inspect the JSON coverage report before relying on a dump.
 
-## What changed in 0.3.0
-
-- Removed the misleading `NtFlushInstructionCache` retry path.
-- Never changes remote page protections and does not contain anti-tamper-specific bypass logic.
-- Salvages partial `ReadProcessMemory` results by recursively subdividing a page down to 64-byte fragments.
-- Keeps original on-disk bytes wherever memory cannot be read, producing an explicit hybrid image instead of silently zeroing data.
-- Records every incomplete page in a JSON report with RVA, address, state, protection, requested bytes, and copied bytes.
-- Refuses import rebuilding below a configurable code-coverage threshold unless explicitly forced.
-- Rejects a rebuilt import table unless every candidate slot is reached by a supported RIP-relative reference, then restores the original import structures.
-- Scans only import-pointer slots whose full eight bytes were actually copied from memory.
-- Supports selecting any normally loaded module with `--module`.
-- Supports listing loaded modules with `--list-modules`.
-- Can create a standard Windows minidump through `MiniDumpWriteDump`.
-- Uses read-only process access: `PROCESS_QUERY_INFORMATION | PROCESS_VM_READ`.
-
 ## Requirements
 
 - Windows 10 or Windows 11, x64.
