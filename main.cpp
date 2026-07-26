@@ -33,7 +33,7 @@
 
 namespace {
 
-constexpr std::string_view kVersion = "0.2.0";
+constexpr std::string_view kVersion = "0.2.1";
 constexpr SIZE_T kPageSize = 0x1000;
 
 using NtFlushInstructionCacheFn = NTSTATUS(NTAPI*)(HANDLE, PVOID, ULONG);
@@ -845,7 +845,7 @@ CopyStats copy_section_from_process(
             refresh(
                 process_handle,
                 remote,
-                static_cast<ULONG>((std::min)(chunk, static_cast<SIZE_T>(MAXULONG))));
+                static_cast<ULONG>(chunk));
             ++stats.refreshes;
             if (memory::is_readable(process_handle, remote)) {
                 count = memory::read(process_handle, remote, local, chunk);
@@ -1792,6 +1792,8 @@ int main(int argc, char** argv) {
     console::success(
         "saved %s (%zu bytes)",
         text::to_utf8(options.output.wstring()).c_str(),
-        image.size());
+        image.size()); 
     return 0;
 }
+
+// ignore this comment
