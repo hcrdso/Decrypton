@@ -1,9 +1,9 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.21)
 
 project(
     decrypton
-    VERSION 0.2.0
-    DESCRIPTION "Windows x64 PE memory image dumper and import rebuilder"
+    VERSION 0.3.0
+    DESCRIPTION "Windows x64 PE memory snapshot, coverage reporter, minidump writer, and import rebuilder"
     LANGUAGES CXX
 )
 
@@ -16,6 +16,7 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
 endif()
 
 add_executable(decrypton main.cpp)
+target_link_libraries(decrypton PRIVATE Dbghelp)
 target_compile_features(decrypton PRIVATE cxx_std_20)
 target_compile_definitions(
     decrypton
