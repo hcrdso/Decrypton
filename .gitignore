@@ -1,0 +1,14 @@
+/build/
+/out/
+*.exe
+*.dll
+*.dmp
+*.bin
+*.json
+*.pdb
+*.ilk
+*.obj
+*.user
+*.suo
+.vs/
+CMakeSettings.json
