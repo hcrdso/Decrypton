@@ -1,194 +1,247 @@
-# Decrypton
+# Decrypton 0.4.0
 
-**Windows x64 PE memory snapshotter, coverage reporter, minidump writer, and conservative import rebuilder.**
+**Windows PE capture, reconstruction, verification, diffing and explicit-key offline transformation suite.**
 
-![Version](https://img.shields.io/badge/version-0.3.0-0ea5e9)
 ![Platform](https://img.shields.io/badge/platform-Windows%20x64-0078d4)
 ![C++](https://img.shields.io/badge/C%2B%2B-20-00599c)
-![License](https://img.shields.io/badge/license-AGPL--3.0-663399)
+![CMake](https://img.shields.io/badge/CMake-3.21%2B-064f8c)
 ![Status](https://img.shields.io/badge/status-experimental-f59e0b)
+![License](https://img.shields.io/badge/license-AGPL--3.0-blue)
 
 </div>
 
 > [!IMPORTANT]
-> Use Decrypton only on software and processes you own or are explicitly authorized to inspect.
+> Decrypton is intended for binaries and processes you own or are explicitly authorized to analyze. It does not change remote page protections, bypass protected-process boundaries, disable security products, or include anti-tamper evasion.
 
-> [!WARNING]
-> Version 0.3.0 is experimental. A structurally valid output file is not necessarily runnable. Always retain the original executable and inspect the JSON coverage report before relying on a dump.
+## Scope
+
+Decrypton operates in user mode using documented Windows APIs. The capture command reads only memory that Windows reports as accessible. Unreadable bytes remain sourced from the original disk image, and coverage is recorded in the JSON report.
+
+The transform command is not automatic cryptanalysis. It requires the exact algorithm, key and IV supplied by the operator.
 
 ## Requirements
 
-- Windows 10 or Windows 11, x64.
+- Windows 10 or Windows 11 x64.
 - Visual Studio 2022 with **Desktop development with C++**.
 - Windows SDK.
 - CMake 3.21 or newer.
 
-Decrypton currently supports PE32+ / AMD64 images only.
+## Build
 
-## Building
+From an x64 Developer Command Prompt, the simplest route is:
 
-From an **x64 Native Tools Command Prompt for Visual Studio 2022**:
+```cmd
+build-release.cmd
+```
+
+Or run the individual commands:
+
+```cmd
+cmake --preset vs2022-x64
+cmake --build --preset release
+ctest --preset release
+```
+
+Without presets:
 
 ```cmd
 cmake -S . -B build -A x64
 cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
 ```
 
-The executable will normally be written to:
+The executable is generated at:
 
 ```text
 build\Release\decrypton.exe
 ```
 
-Preset alternative:
+## Commands
+
+### Capture
 
 ```cmd
-cmake --preset vs2022-x64
-cmake --build --preset release
+decrypton capture --process Example.exe --output Example-dumped.exe
 ```
 
-To rebuild from a clean directory:
+Dump a selected DLL:
 
 ```cmd
-rmdir /S /Q build
-cmake -S . -B build -A x64
-cmake --build build --config Release
+decrypton capture --process Example.exe --module ExampleCore.dll --output ExampleCore-dumped.dll
 ```
 
-## Usage
+Produce coverage JSON and a Windows minidump:
+
+```cmd
+decrypton capture --process Example.exe ^
+  --output Example-dumped.exe ^
+  --report Example-report.json ^
+  --minidump Example.dmp
+```
+
+Conservative capture without import rebuilding:
+
+```cmd
+decrypton capture --process Example.exe --output Example-raw.exe --no-imports
+```
+
+The old 0.3 syntax remains valid:
+
+```cmd
+decrypton --process Example.exe --output Example-dumped.exe
+```
+
+Run `decrypton capture --help` for every capture option.
+
+### Inspect
+
+```cmd
+decrypton inspect Example-dumped.exe
+```
+
+Save a machine-readable report:
+
+```cmd
+decrypton inspect Example-dumped.exe --json inspect.json
+```
+
+The output includes:
+
+- SHA-256.
+- PE32 or PE32+ format and machine.
+- Image base and entry point.
+- Section RVAs, raw ranges, characteristics and Shannon entropy.
+- Populated PE data directories.
+
+### Verify
+
+```cmd
+decrypton verify Example-dumped.exe
+```
+
+Strict mode treats warnings as failure:
+
+```cmd
+decrypton verify Example-dumped.exe --strict --json verify.json
+```
+
+The validator checks:
+
+- DOS, NT and optional headers.
+- File and section alignment.
+- Raw and virtual section bounds and overlaps.
+- `SizeOfHeaders` and `SizeOfImage`.
+- Entry-point placement.
+- Data-directory bounds.
+- Import descriptors, thunk arrays and import names.
+- Export tables.
+- Base-relocation blocks.
+- x64 exception-directory sizing.
+- TLS-directory bounds.
+
+Exit status is zero only when validation succeeds under the selected mode.
+
+### Diff
+
+```cmd
+decrypton diff Original.exe Candidate.exe
+```
+
+With JSON and a custom block size:
+
+```cmd
+decrypton diff Original.exe Candidate.exe --block 4096 --json diff.json
+```
+
+The command reports:
+
+- Both SHA-256 hashes and sizes.
+- Total changed bytes.
+- Contiguous changed ranges.
+- Changed fixed-size blocks.
+- Changed bytes for same-named PE sections.
+
+A nonzero exit status means the files differ.
+
+### Offline transform
+
+Repeating-key XOR:
+
+```cmd
+decrypton transform encrypted.bin ^
+  --algorithm xor ^
+  --key-hex A55A10FF ^
+  --output decoded.bin
+```
+
+AES-256-CBC decryption with PKCS#7 padding:
+
+```cmd
+decrypton transform encrypted.bin ^
+  --algorithm aes-256-cbc ^
+  --mode decrypt ^
+  --key-hex 000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F ^
+  --iv-hex 0F0E0D0C0B0A09080706050403020100 ^
+  --output decoded.bin
+```
+
+AES encryption uses the same command with `--mode encrypt`.
+
+> [!CAUTION]
+> Command-line keys can be retained by shell history or process-observation tools. Use disposable laboratory environments and clear sensitive history when appropriate.
+
+## Recommended workflow
+
+```cmd
+decrypton capture --process LabTarget.exe --output capture.exe --report capture.json
+decrypton verify capture.exe --json verification.json
+decrypton inspect capture.exe --json inspection.json
+decrypton diff LabTarget-original.exe capture.exe --json differences.json
+```
+
+This separates acquisition from analysis and makes each decision auditable.
+
+## Project layout
 
 ```text
-decrypton.exe --process <name> [options]
-decrypton.exe --pid <id> [options]
-decrypton.exe [process.exe] [limit-percent]
+.
+├── include/decrypton/app.hpp
+├── src/main.cpp
+├── src/capture.cpp
+├── src/offline.cpp
+├── tests/transform-roundtrip.ps1
+├── CMakeLists.txt
+├── CMakePresets.json
+├── build-release.cmd
+├── clean-build.cmd
+└── .github/workflows/build.yml
 ```
 
-### Options
+## Testing
 
-| Option | Description |
-|---|---|
-| `-p, --process <name>` | Select the target process by executable name. |
-| `--pid <id>` | Select the target process by PID. |
-| `-m, --module <name>` | Dump a loaded module instead of the process main module. |
-| `--list-modules` | List normally loaded modules and exit. |
-| `-o, --output <path>` | Set the output PE path. |
-| `-l, --limit <1-100>` | Copy only the selected percentage of each executable section. |
-| `--min-coverage <1-100>` | Minimum copied-code coverage required before import rebuilding. Default: `80`. |
-| `--no-data` | Keep non-executable sections from the disk image. |
-| `--no-imports` | Preserve the original import structures. |
-| `--aggressive-imports` | Broaden resolved-import scanning. May increase false positives. |
-| `--force-imports` | Keep a rebuilt table even when normal safety checks reject it. |
-| `--report <path>` | Set the JSON report path. |
-| `--no-report` | Disable the JSON report. |
-| `--minidump <path>` | Create a standard Windows minidump. |
-| `--version` | Display the program version. |
-| `-h, --help` | Display command-line help. |
+CTest currently covers:
 
-## Examples
+- Version and help dispatch.
+- Structural verification of the built executable.
+- AES-256-CBC encrypt/decrypt round-trip.
+- XOR round-trip.
 
-Dump the main module of a process:
+GitHub Actions builds and tests the project on `windows-2022`.
 
-```cmd
-decrypton.exe --process Example.exe --output Example-dumped.exe
-```
+## Limitations
 
-Dump a specific loaded DLL:
-
-```cmd
-decrypton.exe --process Example.exe --module ExampleCore.dll --output ExampleCore-dumped.dll
-```
-
-List modules first:
-
-```cmd
-decrypton.exe --pid 1234 --list-modules
-```
-
-Create a PE snapshot, JSON report, and Windows minidump:
-
-```cmd
-decrypton.exe --pid 1234 ^
-  --output snapshot.exe ^
-  --report snapshot.json ^
-  --minidump snapshot.dmp
-```
-
-Preserve imports and copy only memory-backed executable data:
-
-```cmd
-decrypton.exe --process Example.exe --no-imports --no-data
-```
-
-Require at least 95% code coverage before import rebuilding:
-
-```cmd
-decrypton.exe --process Example.exe --min-coverage 95
-```
-
-## Reading the result
-
-Decrypton starts with the original file on disk and overlays only bytes successfully read from the live process. Therefore:
-
-- A page copied completely from memory represents the live image.
-- A partially copied page contains a mixture of live bytes and original disk bytes.
-- An unreadable page remains unchanged from the original disk image.
-- The JSON report identifies every partial or failed page.
-
-A result with low executable-section coverage should be treated as an analysis artifact, not as a reconstructed executable.
-
-## Import reconstruction safeguards
-
-Resolved imports are matched against named exports from loaded modules. Decrypton then attempts to rebuild a new import section and redirect supported x64 RIP-relative references.
-
-By default, the rebuild is discarded when:
-
-- copied code coverage is below `--min-coverage`;
-- no reliable import slots are found;
-- the PE has no room for another section header;
-- the reconstructed section fails validation; or
-- one or more candidate import slots have no supported RIP-relative code reference.
-
-When a rebuild is discarded, Decrypton restores the original import descriptors, lookup thunks, IAT thunks, module names, and import-by-name records from the disk image.
-
-`--force-imports` disables some of these conservative checks and should be used only for controlled research where manual validation is expected.
-
-## Minidumps
-
-`--minidump` uses the documented `MiniDumpWriteDump` API and includes:
-
-- data and code segments;
-- handle information;
-- unloaded-module information;
-- full memory-region metadata;
-- thread information.
-
-It is not a full-memory dump and may omit inaccessible memory.
-
-## Known limitations
-
-- PE32+ / AMD64 only.
-- Does not enumerate manually mapped or hidden modules.
-- Does not change page protections or force inaccessible pages to become readable.
-- Does not implement anti-tamper-specific hooks, callbacks, drivers, or execution triggering.
-- Export matching currently uses named, non-forwarded exports.
-- RIP-relative repair is intentionally limited and is not a complete x86-64 decoder.
-- Delay-import reconstruction is not implemented.
-- Memory-only PE reconstruction and loose executable-region carving are not implemented.
-- Self-modifying code can change while the snapshot is being captured.
-- A generated PE may still require manual repair in a PE editor or reverse-engineering suite.
-
-Decrypton 0.3.0 deliberately does **not** incorporate their anti-tamper-specific decryption behavior. The adopted design ideas are general-purpose concepts such as modular PE handling, coverage accounting, module selection, minidumps, conservative reconstruction, and detailed validation.
+- Capture supports x64 PE32+ modules.
+- Offline inspection and verification support PE32 and PE32+.
+- Capture cannot read inaccessible, guarded or protected memory.
+- Import reconstruction is heuristic and should always be verified afterward.
+- AES-CBC transform expects PKCS#7-compatible padding.
+- The verifier is intentionally conservative and may report unusual but loadable images.
+- Decrypton does not recover unknown cryptographic keys or identify every custom transform automatically.
 
 ## Responsible use
 
-Decrypton is intended for authorized reverse engineering, interoperability work, software preservation, incident response, malware analysis in isolated environments, and research on binaries you are permitted to inspect.
-
-You are responsible for complying with applicable laws, licenses, platform policies, and contractual obligations.
-
-## License
-
-Decrypton is licensed under the **GNU Affero General Public License v3.0**.
+Use Decrypton only for legitimate reverse engineering, incident response, interoperability, software preservation, controlled malware research, education, and authorized competitions. You are responsible for complying with applicable law, licenses, rules and scope limitations.
 
 ## Author
 
-Created by [hcrdso](https://github.com/hcrdso).
+Created by **hcrdso**.
