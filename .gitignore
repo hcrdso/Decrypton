@@ -1,14 +1,7 @@
 /build/
 /out/
-*.exe
-*.dll
 *.dmp
-*.bin
-*.json
-*.pdb
-*.ilk
-*.obj
+*.tmp
 *.user
 *.suo
 .vs/
-CMakeSettings.json
