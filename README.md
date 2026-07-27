@@ -1,4 +1,4 @@
-# Decrypton 0.4.0
+# Decrypton 1.0.0
 
 **Windows PE capture, reconstruction, verification, diffing and explicit-key offline transformation suite.**
 
@@ -29,12 +29,6 @@ The transform command is not automatic cryptanalysis. It requires the exact algo
 ## Build
 
 From an x64 Developer Command Prompt, the simplest route is:
-
-```cmd
-build-release.cmd
-```
-
-Or run the individual commands:
 
 ```cmd
 cmake --preset vs2022-x64
@@ -200,22 +194,6 @@ decrypton diff LabTarget-original.exe capture.exe --json differences.json
 ```
 
 This separates acquisition from analysis and makes each decision auditable.
-
-## Project layout
-
-```text
-.
-├── include/decrypton/app.hpp
-├── src/main.cpp
-├── src/capture.cpp
-├── src/offline.cpp
-├── tests/transform-roundtrip.ps1
-├── CMakeLists.txt
-├── CMakePresets.json
-├── build-release.cmd
-├── clean-build.cmd
-└── .github/workflows/build.yml
-```
 
 ## Testing
 
