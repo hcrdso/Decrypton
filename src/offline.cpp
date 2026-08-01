@@ -37,7 +37,7 @@
 
 namespace {
 
-constexpr std::string_view kVersion = "0.4.0";
+constexpr std::string_view kVersion = "3.7.5";
 constexpr size_t kMaximumStringLength = 4096;
 constexpr size_t kMaximumImportEntries = 1'000'000;
 
