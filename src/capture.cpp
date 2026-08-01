@@ -38,7 +38,7 @@
 
 namespace {
 
-constexpr std::string_view kVersion = "0.4.0";
+constexpr std::string_view kVersion = "3.7.5";
 constexpr SIZE_T kPageSize = 0x1000;
 
 
