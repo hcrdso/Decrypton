@@ -1,4 +1,4 @@
-# Decrypton 0.4.0
+# Decrypton
 
 **Windows PE capture, reconstruction, verification, diffing and explicit-key offline transformation suite.**
 
