@@ -6,7 +6,7 @@
 
 namespace {
 
-constexpr std::string_view kVersion = "0.4.0";
+constexpr std::string_view kVersion = "3.7.5";
 
 void print_suite_help() {
     std::printf(
